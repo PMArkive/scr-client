@@ -3,19 +3,16 @@
 
 #include <sourcemod>
 #include <autoexecconfig>
-#include <socket>
-#include <updater>
+#include <websocket>
+#include <ripext>
 #include <steamworks>
 
-#tryinclude <morecolors> // Morecolors defines a max buffer as well as bytebuffer but bytebuffer does if defined check
+#tryinclude <morecolors>
 #if !defined _colors_included
   #include <multicolors>
 #endif
 
-#include <bytebuffer>
-
 #define PLUGIN_VERSION "1.0"
-#define UPDATE_URL "https://raw.githubusercontent.com/maxijabase/scr-client/main/updatefile.txt"
 
 char g_sHostname[64];
 char g_sHost[64] = "127.0.0.1";
@@ -34,13 +31,17 @@ ConVar g_cPrefix;
 ConVar g_cFlag;
 ConVar g_cHostname;
 
+// Display format convars
+ConVar g_cChatFormat;
+ConVar g_cEventFormat;
+
 // Event convars
 ConVar g_cPlayerEvent;
 ConVar g_cBotPlayerEvent;
 ConVar g_cMapEvent;
 
-// Socket connection handle
-Handle g_hSocket;
+// WebSocket connection handle
+WebSocket g_hWebSocket;
 
 // Forward handles
 Handle g_hMessageSendForward;
@@ -51,19 +52,20 @@ Handle g_hEventReceiveForward;
 EngineVersion g_evEngine;
 
 #include "include/scr"
+#include "scr/messages.sp"
 
 public Plugin myinfo = 
 {
   name = "Source Chat Relay", 
-  author = "Fishy, updates by ampere", 
-  description = "Communicate between Discord & In-Game, monitor server without being in-game, control the flow of messages and user base engagement!", 
-  version = "1.0", 
-  url = "https://keybase.io/RumbleFrog"
+  author = "ampere", 
+  description = "Rewrite of Source Chat Relay by Fishy", 
+  version = PLUGIN_VERSION, 
+  url = "https://github.com/maxijabase"
 };
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
 {
-  RegPluginLibrary("Source-Chat-Relay");
+  RegPluginLibrary("scr");
   
   CreateNative("SCR_SendMessage", Native_SendMessage);
   CreateNative("SCR_SendEvent", Native_SendEvent);
@@ -83,23 +85,16 @@ public void OnPluginStart()
   g_cPrefix = AutoExecConfig_CreateConVar("scr_prefix", "", "Prefix required to send message to Discord. If empty, none is required.", FCVAR_NONE);
   g_cFlag = AutoExecConfig_CreateConVar("scr_flag", "", "If prefix is enabled, this admin flag is required to send message using the prefix", FCVAR_PROTECTED);
   g_cHostname = AutoExecConfig_CreateConVar("scr_hostname", "", "The hostname/displayname to send with messages. If left empty, it will use the server's hostname", FCVAR_NONE);
+  g_cChatFormat = AutoExecConfig_CreateConVar("scr_chat_format", "", "Format string for incoming chat messages, using ordered string arguments in this order: entity, name, message. If empty, uses the built-in default.", FCVAR_NONE);
+  g_cEventFormat = AutoExecConfig_CreateConVar("scr_event_format", "", "Format string for incoming events, using ordered string arguments in this order: entity, event, data. If empty, uses the built-in default.", FCVAR_NONE);
   
-  AutoExecConfig_ExecuteFile();
   AutoExecConfig_CleanFile();
+  AutoExecConfig_ExecuteFile();
 
   // Start basic event convars
   g_cPlayerEvent = AutoExecConfig_CreateConVar("scr_event_player", "0", "Enable player connect/disconnect events", FCVAR_NONE, true, 0.0, true, 1.0);
   g_cBotPlayerEvent = AutoExecConfig_CreateConVar("scr_event_botplayer", "0", "Enable bot player connect/disconnect events", FCVAR_NONE, true, 0.0, true, 1.0);
   g_cMapEvent = AutoExecConfig_CreateConVar("scr_event_map", "0", "Enable map start/end events", FCVAR_NONE, true, 0.0, true, 1.0);
-  
-  g_hSocket = SocketCreate(SOCKET_TCP, OnSocketError);
-  
-  SocketSetOption(g_hSocket, SocketReuseAddr, 1);
-  SocketSetOption(g_hSocket, SocketKeepAlive, 1);
-  
-  #if defined DEBUG
-    SocketSetOption(g_hSocket, DebugMode, 1);
-  #endif
   
   g_hMessageSendForward = CreateGlobalForward("SCR_OnMessageSend", ET_Event, Param_Cell, Param_String, Param_String);
   g_hMessageReceiveForward = CreateGlobalForward("SCR_OnMessageReceive", ET_Event, Param_String, Param_Cell, Param_String, Param_String, Param_String);
@@ -111,11 +106,6 @@ public void OnPluginStart()
   // Hook player connect and disconnect events separately
   HookEvent("player_connect", Event_OnPlayerConnectionChange);
   HookEvent("player_disconnect", Event_OnPlayerConnectionChange);
-}
-
-public void Updater_OnLoaded()
-{
-  Updater_AddPlugin(UPDATE_URL);
 }
 
 public void OnConfigsExecuted()
@@ -163,182 +153,252 @@ public void OnConfigsExecuted()
   
   delete file;
   
-  if (!SocketIsConnected(g_hSocket))
+  // If we're already connected, this is a convar-only reload, don't
+  // reconnect, just re-announce the map like the pre-rewrite behavior did.
+  if (g_hWebSocket != null && g_hWebSocket.Connected)
   {
-    ConnectRelay();
+    if (g_cMapEvent.BoolValue)
+    {
+      char map[64];
+      GetCurrentMap(map, sizeof map);
+      DispatchEvent("Map Start", map);
+    }
     return;
   }
   
-  if (g_cMapEvent.BoolValue)
-  {
-    char map[64];
-    GetCurrentMap(map, sizeof map);
-    EventMessage("Map Start", map).Dispatch();
-  }
+  ConnectRelay();
 }
 
 void ConnectRelay()
 {
-  if (!SocketIsConnected(g_hSocket))
+  if (g_hWebSocket != null)
   {
-    SocketConnect(g_hSocket, OnSocketConnected, OnSocketReceive, OnSocketDisconnected, g_sHost, g_iPort);
+    delete g_hWebSocket;
+  }
+  
+  char sUrl[128];
+  Format(sUrl, sizeof sUrl, "ws://%s:%d", g_sHost, g_iPort);
+  
+  // Plain text mode: JSON payloads are encoded/decoded with ripext rather
+  // than the WebSocket extension's own JSON mode, since sm-ext-json's JSON
+  // methodmap collides with ripext's.
+  g_hWebSocket = new WebSocket(sUrl, WebSocket_STRING);
+  
+  g_hWebSocket.SetOpenCallback(OnWsOpen);
+  g_hWebSocket.SetMessageCallback(OnWsMessage);
+  g_hWebSocket.SetCloseCallback(OnWsClose);
+  g_hWebSocket.SetErrorCallback(OnWsError);
+  
+  g_hWebSocket.AutoReconnect = true;
+  g_hWebSocket.MinReconnectWait = 1000;
+  g_hWebSocket.MaxReconnectWait = 30000;
+  
+  g_hWebSocket.Connect();
+}
+
+/**
+ * Serializes a message to the relay if connected, and always frees the handle.
+ */
+void SendToRelay(JSONObject obj)
+{
+  if (g_hWebSocket != null && g_hWebSocket.Connected)
+  {
+    char buffer[1024];
+    
+    if (obj.ToString(buffer, sizeof buffer))
+    {
+      g_hWebSocket.WriteString(buffer);
+    }
+    else
+    {
+      LogError("Failed to serialize outgoing message (buffer too small?)");
+    }
+  }
+  
+  delete obj;
+}
+
+public void OnWsOpen(WebSocket ws)
+{
+  SendToRelay(BuildAuthenticateMessage(g_sToken));
+  LogMessage("WebSocket connected, sent authenticate request");
+}
+
+public void OnWsMessage(WebSocket ws, const char[] message, int wireSize)
+{
+  JSONObject obj = JSONObject.FromString(message);
+  
+  if (obj == null)
+  {
+    LogError("Received malformed JSON from relay: %s", message);
+    return;
+  }
+  
+  HandleMessage(obj);
+  delete obj;
+}
+
+public void OnWsClose(WebSocket ws, int code, const char[] reason)
+{
+  LogMessage("WebSocket closed (code %d): %s", code, reason);
+}
+
+public void OnWsError(WebSocket ws, const char[] errMsg)
+{
+  LogError("WebSocket error: %s", errMsg);
+}
+
+void HandleMessage(JSONObject obj)
+{
+  char type[32];
+  
+  if (!obj.GetString("type", type, sizeof type))
+  {
+    return;
+  }
+  
+  if (StrEqual(type, "chat"))
+  {
+    HandleChatMessage(obj);
+  }
+  else if (StrEqual(type, "event"))
+  {
+    HandleEventMessage(obj);
+  }
+  else if (StrEqual(type, "authenticateResponse"))
+  {
+    HandleAuthResponse(obj);
+  }
+}
+
+void HandleChatMessage(JSONObject obj)
+{
+  char entity[64];
+  char sIdType[16];
+  char id[64];
+  char name[MAX_NAME_LENGTH];
+  char message[MAX_COMMAND_LENGTH];
+  
+  obj.GetString("entityName", entity, sizeof entity);
+  obj.GetString("idType", sIdType, sizeof sIdType);
+  obj.GetString("id", id, sizeof id);
+  obj.GetString("username", name, sizeof name);
+  obj.GetString("message", message, sizeof message);
+  
+  IdentificationType idType = StringToIdType(sIdType);
+  
+  // Strip anything beyond 3 bytes for character as chat can't render it
+  StripCharsByBytes(entity, sizeof entity);
+  StripCharsByBytes(name, sizeof name);
+  StripCharsByBytes(message, sizeof message);
+  
+  Action result;
+  
+  Call_StartForward(g_hMessageReceiveForward);
+  Call_PushString(entity);
+  Call_PushCell(idType);
+  Call_PushString(id);
+  Call_PushStringEx(name, sizeof name, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
+  Call_PushStringEx(message, sizeof message, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
+  Call_Finish(result);
+  
+  if (result >= Plugin_Handled)
+  {
+    return;
+  }
+  
+  char format[256];
+  g_cChatFormat.GetString(format, sizeof format);
+  
+  if (strlen(format) > 0)
+  {
+    // Bound as %s arguments rather than substituted into the template text,
+    // so a chat message containing a literal '%' (e.g. "50% hp") can't be
+    // misparsed as a format specifier by CPrintToChatAll.
+    CPrintToChatAll(format, entity, name, message);
+  }
+  else if (SupportsHexColor(g_evEngine))
+  {
+    CPrintToChatAll("{gold}[%s] {azure}%s{white}: {grey}%s", entity, name, message);
   }
   else
   {
-    LogMessage("Socket already connected");
+    CPrintToChatAll("\x10[%s] \x0C%s\x01: \x08%s", entity, name, message);
   }
 }
 
-public Action Timer_Reconnect(Handle timer)
+void HandleEventMessage(JSONObject obj)
 {
-  ConnectRelay();
-  return Plugin_Continue;
-}
-
-void StartReconnectTimer()
-{
-  if (SocketIsConnected(g_hSocket))
+  char entity[64];
+  char event[MAX_EVENT_NAME_LENGTH];
+  char data[MAX_COMMAND_LENGTH];
+  
+  obj.GetString("entityName", entity, sizeof entity);
+  obj.GetString("event", event, sizeof event);
+  obj.GetString("data", data, sizeof data);
+  
+  // Strip anything beyond 3 bytes for character as chat can't render it
+  StripCharsByBytes(entity, sizeof entity);
+  StripCharsByBytes(event, sizeof event);
+  StripCharsByBytes(data, sizeof data);
+  
+  Action result;
+  
+  Call_StartForward(g_hEventReceiveForward);
+  Call_PushStringEx(event, sizeof event, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
+  Call_PushStringEx(data, sizeof data, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
+  Call_Finish(result);
+  
+  if (result >= Plugin_Handled)
   {
-    SocketDisconnect(g_hSocket);
+    return;
   }
   
-  CreateTimer(10.0, Timer_Reconnect);
-}
-
-public void OnSocketDisconnected(Handle socket, any arg)
-{
-  StartReconnectTimer();
-  LogMessage("Socket disconnected");
-}
-
-public void OnSocketError(Handle socket, int errorType, int errorNum, any ary)
-{
-  StartReconnectTimer();
-  LogError("Socket error %i (errno %i) %s", errorType, errorNum, ary);
-}
-
-public void OnSocketConnected(Handle socket, any arg)
-{
-  AuthenticateMessage(g_sToken).Dispatch();
-  LogMessage("Socket Connected");
-}
-
-public void OnSocketReceive(Handle socket, const char[] receiveData, int dataSize, any arg)
-{
-  HandlePackets(receiveData, dataSize);
-}
-
-public void HandlePackets(const char[] sBuffer, int iSize)
-{
-  BaseMessage base = view_as<BaseMessage>(CreateByteBuffer(true, sBuffer, iSize));
+  char format[256];
+  g_cEventFormat.GetString(format, sizeof format);
   
-  switch (base.Type)
+  if (strlen(format) > 0)
   {
-    case MessageChat:
+    // Bound as %s arguments for the same reason as HandleChatMessage above --
+    // event data could in principle also contain a literal '%'.
+    CPrintToChatAll(format, entity, event, data);
+  }
+  else if (SupportsHexColor(g_evEngine))
+  {
+    CPrintToChatAll("{gold}[%s]{white}: {grey}%s", event, data);
+  }
+  else
+  {
+    CPrintToChatAll("\x10[%s]\x01: \x08%s", event, data);
+  }
+}
+
+void HandleAuthResponse(JSONObject obj)
+{
+  bool success = obj.GetBool("success");
+  
+  if (!success)
+  {
+    char reason[128];
+    
+    if (!obj.GetString("reason", reason, sizeof reason))
     {
-      ChatMessage msg = view_as<ChatMessage>(base);
-      
-      Action result;
-      
-      char entity[64];
-      char id[64];
-      char name[MAX_NAME_LENGTH];
-      char message[MAX_COMMAND_LENGTH];
-      
-      msg.GetEntityName(entity, sizeof entity);
-      msg.GetUsername(name, sizeof name);
-      msg.GetMessage(message, sizeof message);
-      
-      // Strip anything beyond 3 bytes for character as chat can't render it
-      StripCharsByBytes(entity, sizeof entity);
-      StripCharsByBytes(name, sizeof name);
-      StripCharsByBytes(message, sizeof message);
-      
-      Call_StartForward(g_hMessageReceiveForward);
-      Call_PushString(entity);
-      Call_PushCell(msg.IDType);
-      Call_PushString(id);
-      Call_PushStringEx(name, sizeof name, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
-      Call_PushStringEx(message, sizeof message, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
-      Call_Finish(result);
-      
-      if (result >= Plugin_Handled)
-      {
-        base.Close();
-        return;
-      }
-      
-      if (SupportsHexColor(g_evEngine))
-      {
-        CPrintToChatAll("{gold}[%s] {azure}%s{white}: {grey}%s", entity, name, message);
-      }
-      else
-      {
-        CPrintToChatAll("\x10[%s] \x0C%s\x01: \x08%s", entity, name, message);
-      }
+      strcopy(reason, sizeof reason, "no reason given");
     }
-    case MessageEvent:
-    {
-      EventMessage msg = view_as<EventMessage>(base);
-      
-      Action result;
-      
-      char event[MAX_EVENT_NAME_LENGTH];
-      char data[MAX_COMMAND_LENGTH];
-      
-      msg.GetEvent(event, sizeof event);
-      msg.GetData(data, sizeof data);
-      
-      // Strip anything beyond 3 bytes for character as chat can't render it
-      StripCharsByBytes(event, sizeof event);
-      StripCharsByBytes(data, sizeof data);
-      
-      Call_StartForward(g_hEventReceiveForward);
-      Call_PushStringEx(event, sizeof event, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
-      Call_PushStringEx(data, sizeof data, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
-      Call_Finish(result);
-      
-      if (result >= Plugin_Handled)
-      {
-        base.Close();
-        return;
-      }
-      
-      if (SupportsHexColor(g_evEngine))
-      {
-        CPrintToChatAll("{gold}[%s]{white}: {grey}%s", event, data);
-      }
-      else
-      {
-        CPrintToChatAll("\x10[%s]\x01: \x08%s", event, data);
-      }
-    }
-    case MessageAuthenticateResponse:
-    {
-      AuthenticateMessageResponse msg = view_as<AuthenticateMessageResponse>(base);
-      
-      if (msg.Response == AuthenticateDenied)
-      {
-        SetFailState("Server denied our token. Stopping.");
-      }
-      
-      LogMessage("Successfully authenticated");
-      
-      // If socket wasn't connected prior, do time check see if we are close to map start
-      if (GetGameTime() <= 20.0 && g_cMapEvent.BoolValue)
-      {
-        char map[64];
-        GetCurrentMap(map, sizeof map);
-        EventMessage("Map Start", map).Dispatch();
-      }
-    }
-    default:
-    {
-      // They crazy
-    }
+    
+    SetFailState("Server denied our token: %s", reason);
+    return;
   }
   
-  base.Close();
+  LogMessage("Successfully authenticated");
+  
+  // If socket wasn't connected prior, do time check see if we are close to map start
+  if (GetGameTime() <= 20.0 && g_cMapEvent.BoolValue)
+  {
+    char map[64];
+    GetCurrentMap(map, sizeof map);
+    DispatchEvent("Map Start", map);
+  }
 }
 
 public void Event_OnPlayerConnectionChange(Event event, const char[] name, bool dontBroadcast)
@@ -376,7 +436,7 @@ public void Event_OnPlayerConnectionChange(Event event, const char[] name, bool 
   
   char eventType[32];
   Format(eventType, sizeof(eventType), "Player %s", isConnecting ? "Connected" : "Disconnected");
-  EventMessage(eventType, clientName).Dispatch();
+  DispatchEvent(eventType, clientName);
 }
 
 public void OnMapEnd()
@@ -388,7 +448,7 @@ public void OnMapEnd()
   
   char map[64];
   GetCurrentMap(map, sizeof map);
-  EventMessage("Map Ended", map).Dispatch();
+  DispatchEvent("Map Ended", map);
 }
 
 public void OnClientSayCommand_Post(int client, const char[] command, const char[] sArgs)
@@ -398,7 +458,7 @@ public void OnClientSayCommand_Post(int client, const char[] command, const char
     return;
   }
   
-  if (!SocketIsConnected(g_hSocket))
+  if (g_hWebSocket == null || !g_hWebSocket.Connected)
   {
     return;
   }
@@ -461,7 +521,39 @@ void DispatchMessage(int client, const char[] sMessage)
     return;
   }
   
-  ChatMessage(IdentificationSteam, id, name, message).Dispatch();
+  SendToRelay(BuildChatMessage(IdentificationSteam, id, name, message));
+}
+
+/**
+ * Fires SCR_OnEventSend and relays the event unless a plugin blocks it.
+ *
+ * This is the single path every event goes through, whether it originates
+ * from scr's own built-in hooks (player connect/disconnect, map start/end)
+ * or from a third-party plugin calling SCR_SendEvent. Neither has a
+ * shortcut around the forward, so a companion plugin can observe or block
+ * any event the same way regardless of who raised it.
+ */
+void DispatchEvent(const char[] event, const char[] data)
+{
+  char eventBuffer[MAX_EVENT_NAME_LENGTH];
+  char dataBuffer[MAX_COMMAND_LENGTH];
+  
+  strcopy(eventBuffer, sizeof eventBuffer, event);
+  strcopy(dataBuffer, sizeof dataBuffer, data);
+  
+  Action result;
+  
+  Call_StartForward(g_hEventSendForward);
+  Call_PushStringEx(eventBuffer, sizeof eventBuffer, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
+  Call_PushStringEx(dataBuffer, sizeof dataBuffer, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
+  Call_Finish(result);
+  
+  if (result >= Plugin_Handled)
+  {
+    return;
+  }
+  
+  SendToRelay(BuildEventMessage(eventBuffer, dataBuffer));
 }
 
 public any Native_SendMessage(Handle plugin, int numParams)
@@ -475,7 +567,7 @@ public any Native_SendMessage(Handle plugin, int numParams)
   int client = GetNativeCell(1);
   FormatNativeString(0, 2, 3, sizeof buffer, _, buffer);
   DispatchMessage(client, buffer);
-  return;
+  return 0;
 }
 
 public any Native_SendEvent(Handle plugin, int numParams)
@@ -485,23 +577,13 @@ public any Native_SendEvent(Handle plugin, int numParams)
     ThrowNativeError(SP_ERROR_NATIVE, "Insufficient parameters");
   }
   
-  Action result;
-  
   char event[MAX_EVENT_NAME_LENGTH];
   char data[MAX_COMMAND_LENGTH];
   
   GetNativeString(1, event, sizeof event);
   FormatNativeString(0, 2, 3, sizeof data, _, data);
   
-  Call_StartForward(g_hEventSendForward);
-  Call_PushStringEx(event, sizeof event, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
-  Call_PushStringEx(data, sizeof data, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
-  Call_Finish(result);
-  
-  if (result >= Plugin_Handled)
-    return 0;
-  
-  EventMessage(event, data).Dispatch();
+  DispatchEvent(event, data);
   
   return 0;
 }
@@ -547,14 +629,6 @@ void StripCharsByBytes(char[] sBuffer, int iSize, int iMaxBytes = 3)
   
   Format(sBuffer, iSize, "%s", sClone);
 }
-
-static int localIPRanges[] = 
-{
-  10 << 24,  // 10.
-  127 << 24 | 1,  // 127.0.0.1
-  127 << 24 | 16 << 16,  // 127.16.
-  192 << 24 | 168 << 16,  // 192.168.
-};
 
 int Server_GetPort()
 {
