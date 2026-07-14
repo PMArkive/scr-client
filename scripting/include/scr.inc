@@ -11,6 +11,10 @@
 #define MAX_COMMAND_LENGTH 512
 #endif
 
+#if !defined MAX_COMMAND_OUTPUT_LENGTH
+#define MAX_COMMAND_OUTPUT_LENGTH 2048
+#endif
+
 /**
  * Identification type of the unique ID accompanying a chat message.
  */
@@ -57,6 +61,16 @@ forward Action SCR_OnEventSend(char[] sEvent, char[] sData);
  * @param sData			Data of the event. The size of which is MAX_COMMAND_LENGTH
  */
 forward Action SCR_OnEventReceive(char[] sEvent, char[] sData);
+
+/**
+ * Called upon receiving a remote server command from an authorized Discord
+ * operator (see /op in scr-server). Return Plugin_Handled or higher to
+ * block the command from being executed with ServerCommand().
+ * 
+ * @param sCommand		The command to be executed. The size of which is MAX_COMMAND_LENGTH
+ * @param sIssuedBy		Discord user id of the operator who issued the command. The size of which is 64
+ */
+forward Action SCR_OnCommandReceive(char[] sCommand, char[] sIssuedBy);
 
 /**
  * Sends a message to the router

@@ -89,3 +89,24 @@ stock JSONObject BuildEventMessage(const char[] event, const char[] data)
 
   return obj;
 }
+
+/**
+ * Builds a {type: "commandResponse", output, replyTo} message.
+ *
+ * Sent back after executing a remote command received via a "command"
+ * message, carrying the console output captured by ServerCommandEx() and
+ * the Discord channel node id to deliver it to.
+ *
+ * @note Returned JSONObject must be passed to SendToRelay, which serializes it
+ * with JSONObject.ToString and sends it via WebSocket.WriteString, then frees it.
+ */
+stock JSONObject BuildCommandResponseMessage(const char[] output, const char[] replyTo)
+{
+  JSONObject obj = new JSONObject();
+
+  obj.SetString("type", "commandResponse");
+  obj.SetString("output", output);
+  obj.SetString("replyTo", replyTo);
+
+  return obj;
+}

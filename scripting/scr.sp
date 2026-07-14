@@ -12,7 +12,7 @@
   #include <multicolors>
 #endif
 
-#define PLUGIN_VERSION "1.0"
+#define PLUGIN_VERSION "1.1"
 
 char g_sHostname[64];
 char g_sHost[64] = "127.0.0.1";
@@ -30,6 +30,7 @@ ConVar g_cPort;
 ConVar g_cPrefix;
 ConVar g_cFlag;
 ConVar g_cHostname;
+ConVar g_cAllowRemoteCommands;
 
 // Display format convars
 ConVar g_cChatFormat;
@@ -48,6 +49,7 @@ Handle g_hMessageSendForward;
 Handle g_hMessageReceiveForward;
 Handle g_hEventSendForward;
 Handle g_hEventReceiveForward;
+Handle g_hCommandReceiveForward;
 
 EngineVersion g_evEngine;
 
@@ -85,6 +87,7 @@ public void OnPluginStart()
   g_cPrefix = AutoExecConfig_CreateConVar("scr_prefix", "", "Prefix required to send message to Discord. If empty, none is required.", FCVAR_NONE);
   g_cFlag = AutoExecConfig_CreateConVar("scr_flag", "", "If prefix is enabled, this admin flag is required to send message using the prefix", FCVAR_PROTECTED);
   g_cHostname = AutoExecConfig_CreateConVar("scr_hostname", "", "The hostname/displayname to send with messages. If left empty, it will use the server's hostname", FCVAR_NONE);
+  g_cAllowRemoteCommands = AutoExecConfig_CreateConVar("scr_allow_remote_commands", "1", "Allow authorized Discord operators (see /op) to run server commands via the relay", FCVAR_PROTECTED, true, 0.0, true, 1.0);
   g_cChatFormat = AutoExecConfig_CreateConVar("scr_chat_format", "", "Format string for incoming chat messages, using ordered string arguments in this order: entity, name, message. If empty, uses the built-in default.", FCVAR_NONE);
   g_cEventFormat = AutoExecConfig_CreateConVar("scr_event_format", "", "Format string for incoming events, using ordered string arguments in this order: entity, event, data. If empty, uses the built-in default.", FCVAR_NONE);
   
@@ -100,6 +103,7 @@ public void OnPluginStart()
   g_hMessageReceiveForward = CreateGlobalForward("SCR_OnMessageReceive", ET_Event, Param_String, Param_Cell, Param_String, Param_String, Param_String);
   g_hEventSendForward = CreateGlobalForward("SCR_OnEventSend", ET_Event, Param_String, Param_String);
   g_hEventReceiveForward = CreateGlobalForward("SCR_OnEventReceive", ET_Event, Param_String, Param_String);
+  g_hCommandReceiveForward = CreateGlobalForward("SCR_OnCommandReceive", ET_Event, Param_String, Param_String);
   
   g_evEngine = GetEngineVersion();
   
@@ -203,7 +207,11 @@ void SendToRelay(JSONObject obj)
 {
   if (g_hWebSocket != null && g_hWebSocket.Connected)
   {
-    char buffer[1024];
+    // Sized to comfortably fit a commandResponse message: captured command
+    // output (MAX_COMMAND_OUTPUT_LENGTH) plus JSON escaping overhead (e.g.
+    // newlines becoming "\n") on top of the other, much shorter message
+    // types this also serializes.
+    char buffer[32768];
     
     if (obj.ToString(buffer, sizeof buffer))
     {
@@ -268,6 +276,10 @@ void HandleMessage(JSONObject obj)
   else if (StrEqual(type, "authenticateResponse"))
   {
     HandleAuthResponse(obj);
+  }
+  else if (StrEqual(type, "command"))
+  {
+    HandleCommandMessage(obj);
   }
 }
 
@@ -399,6 +411,165 @@ void HandleAuthResponse(JSONObject obj)
     GetCurrentMap(map, sizeof map);
     DispatchEvent("Map Start", map);
   }
+}
+
+/**
+ * Runs a server command relayed from an authorized Discord operator (see
+ * /op and the "!"-prefixed command handler in scr-server), capturing its
+ * printed output via ServerCommandEx() and relaying it back to the
+ * originating Discord channel. Authorization is already enforced on the
+ * relay server before this message is ever sent -- scr_allow_remote_commands
+ * is a local kill switch on top of that, in case an admin wants to disable
+ * remote execution on this server specifically without touching the relay's
+ * operator list.
+ */
+void HandleCommandMessage(JSONObject obj)
+{
+  char command[MAX_COMMAND_LENGTH];
+  char issuedBy[64];
+  char replyTo[64];
+
+  obj.GetString("command", command, sizeof command);
+  obj.GetString("issuedBy", issuedBy, sizeof issuedBy);
+  obj.GetString("replyTo", replyTo, sizeof replyTo);
+
+  if (!g_cAllowRemoteCommands.BoolValue)
+  {
+    LogMessage("Ignored remote command from Discord user %s (scr_allow_remote_commands is disabled): %s", issuedBy, command);
+    return;
+  }
+
+  if (strlen(command) == 0)
+  {
+    return;
+  }
+
+  Action result;
+
+  Call_StartForward(g_hCommandReceiveForward);
+  Call_PushStringEx(command, sizeof command, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
+  Call_PushStringEx(issuedBy, sizeof issuedBy, SM_PARAM_STRING_UTF8 | SM_PARAM_STRING_COPY, SM_PARAM_COPYBACK);
+  Call_Finish(result);
+
+  if (result >= Plugin_Handled)
+  {
+    return;
+  }
+
+  char toRun[MAX_COMMAND_LENGTH];
+  BuildExecutableCommand(command, toRun, sizeof toRun);
+
+  if (strlen(toRun) == 0)
+  {
+    LogMessage("Ignored remote command from Discord user %s: %s (translated to nothing runnable)", issuedBy, command);
+
+    if (strlen(replyTo) > 0)
+    {
+      SendToRelay(BuildCommandResponseMessage("(nothing to run)", replyTo));
+    }
+
+    return;
+  }
+
+  LogMessage("Executing remote command from Discord user %s: %s (as: %s)", issuedBy, command, toRun);
+
+  char output[MAX_COMMAND_OUTPUT_LENGTH];
+  ServerCommandEx(output, sizeof output, "%s", toRun);
+
+  if (strlen(replyTo) > 0)
+  {
+    SendToRelay(BuildCommandResponseMessage(output, replyTo));
+  }
+}
+
+/**
+ * Returns the index of the first space or tab in command, or -1 if the
+ * whole string is a single token. Discord messages should only ever
+ * contain plain spaces, but this also tolerates tabs in case a command was
+ * pasted in from somewhere else.
+ */
+int FindArgumentBoundary(const char[] command)
+{
+  int len = strlen(command);
+
+  for (int i = 0; i < len; i++)
+  {
+    if (command[i] == ' ' || command[i] == '\t')
+    {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+/**
+ * Translates a "!"-issued Discord command the same way SourceMod's own
+ * in-game chat triggers do: by default the first word gets an "sm_" prefix,
+ * so a Discord operator sending "!kick 2 baduser" runs the same "sm_kick 2
+ * baduser" admin command a player would trigger by typing "!kick 2
+ * baduser" in chat -- rather than running a raw (and likely nonexistent)
+ * "kick" console command. Chat triggers only apply this translation for
+ * client-issued chat, not commands run directly on the server console,
+ * which is the transport ServerCommandEx() uses here, so it has to be
+ * done explicitly.
+ *
+ * A leading "rcon" word (e.g. "!rcon changelevel de_dust2") skips the
+ * translation and runs the remainder exactly as given, for real console/
+ * engine commands that aren't SourceMod admin commands. A command that
+ * already starts with "sm_" is also left untouched, so it isn't double-
+ * prefixed.
+ *
+ * A leading "sm_rcon" word is treated the same as "rcon", rather than being
+ * left alone by the "already starts with sm_" rule above. SourceMod's own
+ * sm_rcon handler runs its wrapped command with a plain ServerCommand()
+ * instead of ServerCommandEx() when invoked from the server console (as
+ * ServerCommandEx() does here), since it assumes a human is watching the
+ * console directly and will see the output there. That means the wrapped
+ * command's output would never reach our outer capture, and Discord would
+ * see an empty response even though the command ran -- so "!sm_rcon foo"
+ * is routed the same way "!rcon foo" is, straight to the raw command.
+ */
+void BuildExecutableCommand(const char[] command, char[] buffer, int maxlen)
+{
+  int boundary = FindArgumentBoundary(command);
+
+  char firstWord[MAX_COMMAND_LENGTH];
+  strcopy(firstWord, (boundary == -1) ? (strlen(command) + 1) : (boundary + 1), command);
+
+  if (StrEqual(firstWord, "rcon", false) || StrEqual(firstWord, "sm_rcon", false))
+  {
+    if (boundary == -1)
+    {
+      // "rcon"/"sm_rcon" with nothing after it -- nothing to run.
+      buffer[0] = '\0';
+      return;
+    }
+
+    int rest = boundary;
+
+    while (command[rest] == ' ' || command[rest] == '\t')
+    {
+      rest++;
+    }
+
+    strcopy(buffer, maxlen, command[rest]);
+    return;
+  }
+
+  if (strncmp(command, "sm_", 3, false) == 0)
+  {
+    strcopy(buffer, maxlen, command);
+    return;
+  }
+
+  if (boundary == -1)
+  {
+    Format(buffer, maxlen, "sm_%s", command);
+    return;
+  }
+
+  Format(buffer, maxlen, "sm_%s%s", firstWord, command[boundary]);
 }
 
 public void Event_OnPlayerConnectionChange(Event event, const char[] name, bool dontBroadcast)
